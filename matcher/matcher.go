@@ -44,7 +44,7 @@ type worker struct {
 
 	queryTTL int
 	sub, pub *amqp.Channel
-	messages chan pubMessage
+	messages chan subMessage
 	ctx      context.Context
 	es       *elastic.Client
 }
@@ -66,6 +66,12 @@ func (s session) Close() error {
 type pubMessage struct {
 	Topic string                 `json:"topicName"`
 	Data  map[string]interface{} `json:"data"`
+}
+
+type subMatchMap map[string]map[string][]string
+type subMessage struct {
+	SubscribersMatch subMatchMap            `json:"subscribersMatch"`
+	Data             map[string]interface{} `json:"data"`
 }
 
 type subscription struct {
@@ -104,7 +110,7 @@ func (w *worker) init(file string) error {
 func (w *worker) start() {
 	ctx, done := context.WithCancel(context.Background())
 	w.ctx = ctx
-	w.messages = make(chan pubMessage)
+	w.messages = make(chan subMessage)
 
 	go func() {
 		w.publish(w.redial(xsubExchange, xsubExchangeType))
@@ -144,7 +150,7 @@ func (w *worker) redial(exchange string, exchangeType string) chan session {
 				return
 			}
 
-			if err = ch.ExchangeDeclare(exchange, exchangeType, false, true, false, false, nil); err != nil {
+			if err = ch.ExchangeDeclare(exchange, exchangeType, false, false, false, false, nil); err != nil {
 				str := fmt.Sprintf("cannot declare exchange: %v, %v, %v", exchange, exchangeType, err)
 				log.Println(str)
 				sessions <- session{nil, nil, errors.New(str)}
@@ -154,7 +160,7 @@ func (w *worker) redial(exchange string, exchangeType string) chan session {
 			select {
 			case sessions <- session{conn, ch, nil}:
 			case <-w.ctx.Done():
-				log.Println("shutting down new session")
+				log.Println("shutting down new session", exchange)
 				return
 			}
 		}
@@ -204,9 +210,8 @@ func (w *worker) matchData(publication pubMessage) {
 		log.Println("Percolation failed")
 		return
 	}
-	// matchedSubs := make(map[string]map[string][]string)
+	matchedSubs := make(map[string]map[string]map[string]bool)
 	for _, match := range pr.Matches {
-		log.Println(match.Id)
 		query, err := w.es.Get().Index(match.Index).Id(match.Id).Type(".percolator").Do()
 		if err != nil {
 			log.Println("Percolation query fetch failed")
@@ -218,15 +223,40 @@ func (w *worker) matchData(publication pubMessage) {
 			log.Println("Malformed subscription")
 			continue
 		}
-		// matchedSubs[sub.XSUB] :=
+		subscribersMap, ok := matchedSubs[sub.XSUB]
+		if !ok {
+			subscribersMap = make(map[string]map[string]bool)
+			matchedSubs[sub.XSUB] = subscribersMap
+		}
+		subscriptionsMap, ok := subscribersMap[sub.Subscriber]
+		if !ok {
+			subscriptionsMap = make(map[string]bool)
+			subscribersMap[sub.Subscriber] = subscriptionsMap
+		}
+		subscriptionsMap[sub.SubID] = true
 	}
-	w.messages <- publication
+	matchedSubsList := make(subMatchMap)
+	for xsub, subscribersMap := range matchedSubs {
+		matchedSubsList[xsub] = make(map[string][]string)
+		for subscriber, subscriptionsMap := range subscribersMap {
+			subIDs := []string{}
+			for subID := range subscriptionsMap {
+				subIDs = append(subIDs, subID)
+			}
+			matchedSubsList[xsub][subscriber] = subIDs
+		}
+	}
+	matchedData := subMessage{
+		SubscribersMatch: matchedSubsList,
+		Data:             publication.Data,
+	}
+	w.messages <- matchedData
 }
 
 func (w *worker) publish(sessions chan session) {
 	var (
 		reading = w.messages
-		pending = make(chan pubMessage, 1)
+		pending = make(chan subMessage, 1)
 		confirm = make(chan amqp.Confirmation, 1)
 	)
 
@@ -249,30 +279,32 @@ func (w *worker) publish(sessions chan session) {
 			select {
 			case confirmed := <-confirm:
 				if !confirmed.Ack {
+					log.Printf("nack message %d", confirmed.DeliveryTag)
 					if confirmed.DeliveryTag == 0 {
 						return
 					}
-					log.Printf("nack pubMessage %d", confirmed.DeliveryTag)
 				}
 				reading = w.messages
 			case body := <-pending:
-				// headers := amqp.Table{
-				// "instance": 1,
-				// }
+				headers := make(amqp.Table)
+				for xsub := range body.SubscribersMatch {
+					headers[xsub] = int32(1)
+				}
 				mbody, err := json.Marshal(body)
 				if err != nil {
-					log.Printf("Could not marshal the pubMessage")
+					log.Println("Could not marshal the message", err)
 					continue
 				}
 				routingKey := ""
 				err = pub.Publish(xsubExchange, routingKey, false, false, amqp.Publishing{
 					Body:         mbody,
 					DeliveryMode: 2,
-					// Headers:      headers,
-					ContentType: "application/octet-stream",
+					Headers:      headers,
+					ContentType:  "application/octet-stream",
 				})
 				// Retry failed delivery on the next session
 				if err != nil {
+					log.Println("Could not publish the message", err)
 					pending <- body
 					pub.Close()
 					break
@@ -287,6 +319,7 @@ func (w *worker) publish(sessions chan session) {
 				pending <- body
 				reading = nil
 			case <-w.ctx.Done():
+				log.Println("Exiting publihser, context is closed")
 				return
 			}
 		}
