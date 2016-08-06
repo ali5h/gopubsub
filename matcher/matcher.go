@@ -190,7 +190,7 @@ func (w *worker) subscribe(sessions chan session) {
 			return
 		}
 
-		if err := sub.QueueBind(queue.Name, xpubRoutingKey, xpubExchange, false, nil); err != nil {
+		if err := sub.QueueBind(queue.Name, "", xpubExchange, false, nil); err != nil {
 			log.Printf("cannot consume without a binding to exchange: %q, %v", xpubExchange, err)
 			return
 		}
@@ -198,6 +198,17 @@ func (w *worker) subscribe(sessions chan session) {
 		deliveries, err := sub.Consume(queue.Name, "", false, true, false, false, nil)
 		if err != nil {
 			log.Printf("cannot consume from: %q, %v", queue.Name, err)
+			return
+		}
+
+		err = sub.Qos(
+			1,     // prefetch count
+			0,     // prefetch size
+			false, // global
+		)
+
+		if err != nil {
+			log.Printf("cannot set qos: %q, %v", queue.Name, err)
 			return
 		}
 
@@ -317,7 +328,7 @@ func (w *worker) publish(sessions chan session) {
 				routingKey := ""
 				err = pub.Publish(xsubExchange, routingKey, false, false, amqp.Publishing{
 					Body:         mbody,
-					DeliveryMode: 2,
+					DeliveryMode: amqp.Persistent,
 					Headers:      headers,
 					ContentType:  "application/octet-stream",
 				})
