@@ -36,6 +36,8 @@ const xpubExchange = "xpub"
 const xpubExchangeType = "direct"
 const xpubRoutingKey = ""
 const queryCacheTTL = 3600
+const queryIndexType = "cvst"
+const percolatorType = ".percolator"
 
 type worker struct {
 	AMQP          string
@@ -205,14 +207,14 @@ func (w *worker) subscribe(sessions chan session) {
 }
 
 func (w *worker) matchData(publication pubMessage) {
-	pr, err := w.es.Percolate().Doc(publication.Data).Index(publication.Topic).Type("cvst").Do()
+	pr, err := w.es.Percolate().Doc(publication.Data).Index(publication.Topic).Type(queryIndexType).Do()
 	if err != nil {
 		log.Println("Percolation failed")
 		return
 	}
 	matchedSubs := make(map[string]map[string]map[string]bool)
 	for _, match := range pr.Matches {
-		query, err := w.es.Get().Index(match.Index).Id(match.Id).Type(".percolator").Do()
+		query, err := w.es.Get().Index(match.Index).Id(match.Id).Type(percolatorType).Do()
 		if err != nil {
 			log.Println("Percolation query fetch failed")
 			continue
