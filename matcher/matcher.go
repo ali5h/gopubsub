@@ -28,8 +28,9 @@ The flags are:
 const sampleConfig = `
 amqp = "amqp://guest:guest@localhost:5672/"
 elasticsearch = "http://localhost:9200/"
-topic = "new_xpub_data"
+es_workers = 5
 `
+
 const xsubExchange = "xsub"
 const xsubExchangeType = "headers"
 const xpubExchange = "xpub"
@@ -42,13 +43,14 @@ const percolatorType = ".percolator"
 type worker struct {
 	AMQP          string
 	Elasticsearch string
-	Topic         string
+	ESWorkers     int `toml:"es_workers"`
 
-	queryTTL int
-	sub, pub *amqp.Channel
-	messages chan subMessage
-	ctx      context.Context
-	es       *elastic.Client
+	queryTTL    int
+	sub, pub    *amqp.Channel
+	pubMessages chan pubMessage
+	subMessages chan subMessage
+	ctx         context.Context
+	es          *elastic.Client
 }
 
 type session struct {
@@ -112,7 +114,14 @@ func (w *worker) init(file string) error {
 func (w *worker) start() {
 	ctx, done := context.WithCancel(context.Background())
 	w.ctx = ctx
-	w.messages = make(chan subMessage)
+	w.pubMessages = make(chan pubMessage, w.ESWorkers)
+	w.subMessages = make(chan subMessage)
+
+	for i := 0; i < w.ESWorkers; i++ {
+		go func() {
+			w.matchData()
+		}()
+	}
 
 	go func() {
 		w.publish(w.redial(xsubExchange, xsubExchangeType))
@@ -171,24 +180,24 @@ func (w *worker) redial(exchange string, exchangeType string) chan session {
 }
 
 func (w *worker) subscribe(sessions chan session) {
-
 	for sub := range sessions {
 		if sub.err != nil {
 			return
 		}
-		if _, err := sub.QueueDeclare(w.Topic, false, true, true, false, nil); err != nil {
-			log.Printf("cannot consume from exclusive queue: %q, %v", w.Topic, err)
+		queue, err := sub.QueueDeclare("", false, true, true, false, nil)
+		if err != nil {
+			log.Printf("cannot consume from exclusive queue: %q, %v", queue.Name, err)
 			return
 		}
 
-		if err := sub.QueueBind(w.Topic, xpubRoutingKey, xpubExchange, false, nil); err != nil {
+		if err := sub.QueueBind(queue.Name, xpubRoutingKey, xpubExchange, false, nil); err != nil {
 			log.Printf("cannot consume without a binding to exchange: %q, %v", xpubExchange, err)
 			return
 		}
 
-		deliveries, err := sub.Consume(w.Topic, "", false, true, false, false, nil)
+		deliveries, err := sub.Consume(queue.Name, "", false, true, false, false, nil)
 		if err != nil {
-			log.Printf("cannot consume from: %q, %v", w.Topic, err)
+			log.Printf("cannot consume from: %q, %v", queue.Name, err)
 			return
 		}
 
@@ -201,63 +210,71 @@ func (w *worker) subscribe(sessions chan session) {
 				log.Println(err)
 				continue
 			}
-			go w.matchData(newPub)
+			w.pubMessages <- newPub
 		}
 	}
 }
 
-func (w *worker) matchData(publication pubMessage) {
-	pr, err := w.es.Percolate().Doc(publication.Data).Index(publication.Topic).Type(queryIndexType).Do()
-	if err != nil {
-		log.Println("Percolation failed")
-		return
-	}
-	matchedSubs := make(map[string]map[string]map[string]bool)
-	for _, match := range pr.Matches {
-		query, err := w.es.Get().Index(match.Index).Id(match.Id).Type(percolatorType).Do()
-		if err != nil {
-			log.Println("Percolation query fetch failed")
-			continue
-		}
-		var sub subscription
-		err = json.Unmarshal(*query.Source, &sub)
-		if err != nil {
-			log.Println("Malformed subscription")
-			continue
-		}
-		subscribersMap, ok := matchedSubs[sub.XSUB]
-		if !ok {
-			subscribersMap = make(map[string]map[string]bool)
-			matchedSubs[sub.XSUB] = subscribersMap
-		}
-		subscriptionsMap, ok := subscribersMap[sub.Subscriber]
-		if !ok {
-			subscriptionsMap = make(map[string]bool)
-			subscribersMap[sub.Subscriber] = subscriptionsMap
-		}
-		subscriptionsMap[sub.SubID] = true
-	}
-	matchedSubsList := make(subMatchMap)
-	for xsub, subscribersMap := range matchedSubs {
-		matchedSubsList[xsub] = make(map[string][]string)
-		for subscriber, subscriptionsMap := range subscribersMap {
-			subIDs := []string{}
-			for subID := range subscriptionsMap {
-				subIDs = append(subIDs, subID)
+func (w *worker) matchData() {
+	for {
+		select {
+		case publication := <-w.pubMessages:
+			pr, err := w.es.Percolate().Doc(publication.Data).Index(publication.Topic).Type(queryIndexType).Do()
+			if err != nil {
+				log.Println("Percolation failed", err)
+				continue
 			}
-			matchedSubsList[xsub][subscriber] = subIDs
+			matchedSubs := make(map[string]map[string]map[string]bool)
+			for _, match := range pr.Matches {
+				query, err := w.es.Get().Index(match.Index).Id(match.Id).Type(percolatorType).Do()
+				if err != nil {
+					log.Println("Percolation query fetch failed", err)
+					continue
+				}
+				var sub subscription
+				err = json.Unmarshal(*query.Source, &sub)
+				if err != nil {
+					log.Println("Malformed subscription", err)
+					continue
+				}
+				subscribersMap, ok := matchedSubs[sub.XSUB]
+				if !ok {
+					subscribersMap = make(map[string]map[string]bool)
+					matchedSubs[sub.XSUB] = subscribersMap
+				}
+				subscriptionsMap, ok := subscribersMap[sub.Subscriber]
+				if !ok {
+					subscriptionsMap = make(map[string]bool)
+					subscribersMap[sub.Subscriber] = subscriptionsMap
+				}
+				subscriptionsMap[sub.SubID] = true
+			}
+			matchedSubsList := make(subMatchMap)
+			for xsub, subscribersMap := range matchedSubs {
+				matchedSubsList[xsub] = make(map[string][]string)
+				for subscriber, subscriptionsMap := range subscribersMap {
+					subIDs := []string{}
+					for subID := range subscriptionsMap {
+						subIDs = append(subIDs, subID)
+					}
+					matchedSubsList[xsub][subscriber] = subIDs
+				}
+			}
+			matchedData := subMessage{
+				SubscribersMatch: matchedSubsList,
+				Data:             publication.Data,
+			}
+			w.subMessages <- matchedData
+		case <-w.ctx.Done():
+			return
 		}
 	}
-	matchedData := subMessage{
-		SubscribersMatch: matchedSubsList,
-		Data:             publication.Data,
-	}
-	w.messages <- matchedData
+
 }
 
 func (w *worker) publish(sessions chan session) {
 	var (
-		reading = w.messages
+		reading = w.subMessages
 		pending = make(chan subMessage, 1)
 		confirm = make(chan amqp.Confirmation, 1)
 	)
@@ -286,7 +303,7 @@ func (w *worker) publish(sessions chan session) {
 						return
 					}
 				}
-				reading = w.messages
+				reading = w.subMessages
 			case body := <-pending:
 				headers := make(amqp.Table)
 				for xsub := range body.SubscribersMatch {
@@ -344,7 +361,7 @@ func main() {
 	w := worker{
 		AMQP:          "amqp://guest:guest@localhost:5672/",
 		Elasticsearch: "http://localhost:9200/",
-		Topic:         "new_xpub_data",
+		ESWorkers:     5,
 	}
 
 	err := w.init(*fConfig)
