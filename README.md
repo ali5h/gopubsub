@@ -1,2 +1,2 @@
 # gopubsub
-A Content-based publish/subscriber system
+A Content-based publish/subscribe system
