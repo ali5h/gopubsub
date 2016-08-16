@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -11,7 +12,6 @@ import (
 
 	"github.com/naoina/toml"
 	"github.com/streadway/amqp"
-	"golang.org/x/net/context"
 	"gopkg.in/olivere/elastic.v3"
 )
 
@@ -49,7 +49,6 @@ type worker struct {
 	sub, pub    *amqp.Channel
 	pubMessages chan pubMessage
 	subMessages chan subMessage
-	ctx         context.Context
 	es          *elastic.Client
 }
 
@@ -113,24 +112,23 @@ func (w *worker) init(file string) error {
 
 func (w *worker) start() {
 	ctx, done := context.WithCancel(context.Background())
-	w.ctx = ctx
 	w.pubMessages = make(chan pubMessage, w.ESWorkers)
 	w.subMessages = make(chan subMessage)
 
 	for i := 0; i < w.ESWorkers; i++ {
 		go func() {
-			w.matchData()
+			w.matchData(ctx)
 		}()
 	}
 
 	go func() {
-		w.publish(w.redial(xsubExchange, xsubExchangeType))
+		w.publish(ctx, w.redial(ctx, xsubExchange, xsubExchangeType))
 		log.Println("Pub Done")
 		done()
 	}()
 
 	go func() {
-		w.subscribe(w.redial(xpubExchange, xpubExchangeType))
+		w.subscribe(w.redial(ctx, xpubExchange, xpubExchangeType))
 		log.Println("Sub Done")
 		done()
 	}()
@@ -138,7 +136,7 @@ func (w *worker) start() {
 }
 
 // redial continually connects to the URL, exiting the program when no longer possible
-func (w *worker) redial(exchange string, exchangeType string) chan session {
+func (w *worker) redial(ctx context.Context, exchange string, exchangeType string) chan session {
 	url := w.AMQP
 	sessions := make(chan session, 1)
 	go func() {
@@ -170,7 +168,7 @@ func (w *worker) redial(exchange string, exchangeType string) chan session {
 
 			select {
 			case sessions <- session{conn, ch, nil}:
-			case <-w.ctx.Done():
+			case <-ctx.Done():
 				log.Println("shutting down new session", exchange)
 				return
 			}
@@ -226,7 +224,7 @@ func (w *worker) subscribe(sessions chan session) {
 	}
 }
 
-func (w *worker) matchData() {
+func (w *worker) matchData(ctx context.Context) {
 	for {
 		select {
 		case publication := <-w.pubMessages:
@@ -276,14 +274,14 @@ func (w *worker) matchData() {
 				Data:             publication.Data,
 			}
 			w.subMessages <- matchedData
-		case <-w.ctx.Done():
+		case <-ctx.Done():
 			return
 		}
 	}
 
 }
 
-func (w *worker) publish(sessions chan session) {
+func (w *worker) publish(ctx context.Context, sessions chan session) {
 	var (
 		reading = w.subMessages
 		pending = make(chan subMessage, 1)
@@ -348,7 +346,7 @@ func (w *worker) publish(sessions chan session) {
 				// work on pending delivery until ack'd
 				pending <- body
 				reading = nil
-			case <-w.ctx.Done():
+			case <-ctx.Done():
 				log.Println("Exiting publihser, context is closed")
 				return
 			}
